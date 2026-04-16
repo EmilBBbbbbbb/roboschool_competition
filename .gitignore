@@ -7,6 +7,8 @@ logs/
 tmp/
 models/*
 !models/.gitkeep
+.datasets/
+.notebooks/
 <<<<<<< Updated upstream
 .codex
 =======

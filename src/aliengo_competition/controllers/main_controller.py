@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
+import torch
 
 from aliengo_competition.common.run_logger import CompetitionRunLogger
 from aliengo_competition.robot_interface.base import AliengoRobotInterface
@@ -138,6 +140,29 @@ def run(
     yaw_rate_amp = 0.75
     yaw_rate_damping = 0.55
     ang_vel_scale = 0.25
+
+    # Параметры детекции объектов через YOLO.
+    enable_yolo_detection = True
+    yolo_conf_threshold = 0.55
+    yolo_imgsz = 416
+    yolo_detect_every_n_steps = 3
+    yolo_min_box_area_ratio = 0.01
+    yolo_min_streak = 2
+    yolo_device = "cuda:0"
+    yolo_weights_override: str | None = None
+
+    repo_root = Path(__file__).resolve().parents[3]
+    yolo_weights_path = (
+        Path(yolo_weights_override).expanduser().resolve()
+        if yolo_weights_override
+        else repo_root / "weights" / "last.pt"
+    )
+
+    yolo_model = None
+    yolo_enabled = False
+    yolo_step_counter = 0
+    yolo_last_candidate_id: int | None = None
+    yolo_candidate_streak = 0
     # ================== USER PARAMETERS END ==================
 
     segment_start_t = 0.0
@@ -155,6 +180,34 @@ def run(
                 "[Контроллер] Предупреждение: данные фронтальной камеры недоступны. "
                 "Проверьте, что симулятор не запущен в headless-режиме и что включён front_camera_enabled."
             )
+
+        object_name_to_id = {}
+        queue_ids = set()
+        for item in object_queue:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                object_id = int(item[0])
+                object_name = str(item[1]).strip().lower()
+                object_name_to_id[object_name] = object_id
+                queue_ids.add(object_id)
+
+        if enable_yolo_detection:
+            try:
+                from ultralytics import YOLO
+
+                if not yolo_weights_path.exists():
+                    raise FileNotFoundError(f"YOLO weights not found: {yolo_weights_path}")
+
+                yolo_model = YOLO(str(yolo_weights_path))
+                yolo_enabled = True
+                print(f"[Контроллер] YOLO детектор загружен: {yolo_weights_path}")
+                print(f"[Контроллер] YOLO device: {yolo_device}")
+                print(f"[Контроллер] map name->id: {object_name_to_id}")
+                if yolo_device.startswith("cuda") and not torch.cuda.is_available():
+                    yolo_enabled = False
+                    print("[Контроллер] YOLO отключен: CUDA недоступна в текущем окружении.")
+            except Exception as exc:
+                yolo_enabled = False
+                print(f"[Контроллер] YOLO отключен: {exc}")
 
         for step_index in range(total_steps):
             state = robot.get_state()
@@ -228,8 +281,89 @@ def run(
                 current_camera_data,
                 current_object_queue,
             ):
-                """ОБЯЗАТЕЛЬНО: замените заглушку своей логикой и возвращайте id объекта или None."""
-                return None
+                """Возвращает id обнаруженного объекта из object_queue или None."""
+                nonlocal yolo_step_counter, yolo_last_candidate_id, yolo_candidate_streak
+
+                if not yolo_enabled or yolo_model is None:
+                    return None
+
+                yolo_step_counter += 1
+                if yolo_step_counter % max(int(yolo_detect_every_n_steps), 1) != 0:
+                    return None
+
+                if not isinstance(current_camera_data, dict):
+                    return None
+                image = current_camera_data.get("image")
+                if image is None:
+                    return None
+
+                rgb = np.asarray(image)
+                if rgb.ndim != 3 or rgb.shape[2] < 3:
+                    return None
+                if rgb.dtype != np.uint8:
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                rgb = rgb[..., :3]
+
+                # Ultralytics корректно принимает ndarray в формате BGR.
+                bgr = rgb[..., ::-1]
+
+                try:
+                    results = yolo_model.predict(
+                        source=bgr,
+                        conf=float(yolo_conf_threshold),
+                        imgsz=int(yolo_imgsz),
+                        device=yolo_device,
+                        verbose=False,
+                    )
+                except Exception:
+                    return None
+
+                if not results:
+                    return None
+
+                result = results[0]
+                boxes = getattr(result, "boxes", None)
+                if boxes is None or len(boxes) == 0:
+                    return None
+
+                try:
+                    confs = boxes.conf.detach().cpu().numpy().astype(np.float32)
+                    classes = boxes.cls.detach().cpu().numpy().astype(np.int32)
+                    xyxy = boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+                except Exception:
+                    return None
+
+                if confs.size == 0:
+                    return None
+                best_idx = int(np.argmax(confs))
+
+                image_area = float(rgb.shape[0] * rgb.shape[1])
+                if image_area <= 0.0:
+                    return None
+                box = xyxy[best_idx]
+                box_area = max(float(box[2] - box[0]), 0.0) * max(float(box[3] - box[1]), 0.0)
+                if (box_area / image_area) < float(yolo_min_box_area_ratio):
+                    return None
+
+                best_class = int(classes[best_idx])
+                names = getattr(result, "names", {})
+                predicted_name = str(names.get(best_class, best_class)).strip().lower()
+
+                detected_id = object_name_to_id.get(predicted_name)
+                if detected_id is None and best_class in queue_ids:
+                    detected_id = best_class
+                if detected_id is None:
+                    return None
+
+                if yolo_last_candidate_id == detected_id:
+                    yolo_candidate_streak += 1
+                else:
+                    yolo_last_candidate_id = detected_id
+                    yolo_candidate_streak = 1
+
+                if yolo_candidate_streak < max(int(yolo_min_streak), 1):
+                    return None
+                return int(detected_id)
 
             detected_object_id = get_found_object_id(
                 state,
